@@ -1,310 +1,402 @@
-# app.py
-# 실행:
-# pip install streamlit pandas numpy plotly
-# streamlit run app.py
-
-import math
+import re
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import streamlit as st
+import plotly.graph_objects as go
+from streamlit_plotly_events import plotly_events
 
-st.set_page_config(page_title="AI 융합 지진 진원 찾기", layout="wide")
+st.set_page_config(page_title="지진 진원 찾기", layout="wide")
 
-P_SPEED = 6.0   # km/s, 단순화한 P파 속도
-S_SPEED = 3.5   # km/s, 단순화한 S파 속도
+st.title("🌏 지진 진원 찾기: 지구과학 × 수학 융합수업")
 
-st.title("🌍 지구과학 × 수학 × AI 융합: 지진 진원 찾기")
-st.caption("세 관측소의 좌표와 PS시를 이용해 진원거리 원을 그리고, 교점과 공통현으로 진원을 추정합니다.")
+# -----------------------------
+# 1. 수업용 데이터
+# x = 위도, y = 경도
+# -----------------------------
+stations = {
+    "서울 관측소": {"lat": 37.57, "lon": 126.98},
+    "부산 관측소": {"lat": 35.18, "lon": 129.08},
+    "광주 관측소": {"lat": 35.16, "lon": 126.85},
+}
 
-with st.expander("수업 활동 안내", expanded=True):
-    st.markdown("""
-1. 실제 지진 데이터를 보고 진앙의 위도·경도를 확인합니다.
-2. 학생들이 세 관측소의 위도·경도를 조사해 입력합니다.
-3. 각 관측소의 PS시, 즉 S파 도착 시각과 P파 도착 시각의 차이를 입력합니다.
-4. PS시로 진원거리를 계산합니다.
-5. 각 관측소를 중심, 진원거리를 반지름으로 하는 세 원을 좌표평면에 그립니다.
-6. 세 원의 교점 또는 공통현이 만나는 점을 이용해 진원을 추정합니다.
-""")
+actual_epicenter = {
+    "lat": 36.35,
+    "lon": 127.38,
+}
 
-st.sidebar.header("⚙️ 기본 설정")
-p_speed = st.sidebar.number_input("P파 속도(km/s)", value=P_SPEED, min_value=1.0, step=0.1)
-s_speed = st.sidebar.number_input("S파 속도(km/s)", value=S_SPEED, min_value=1.0, step=0.1)
+KM_PER_DEGREE = 111  # 수업용 근사값
 
-st.sidebar.markdown("PS시 → 진원거리 공식")
-st.sidebar.latex(r"d=\frac{V_PV_S}{V_P-V_S}\times (T_S-T_P)")
+for name, s in stations.items():
+    dx = s["lat"] - actual_epicenter["lat"]
+    dy = s["lon"] - actual_epicenter["lon"]
+    degree_distance = np.sqrt(dx**2 + dy**2)
+    s["distance_km"] = round(degree_distance * KM_PER_DEGREE, 1)
+    s["radius_degree"] = degree_distance
+    s["ps_time"] = round(s["distance_km"] / 8, 1)  # 예시용: PS시와 진원거리 관계 단순화
 
-def ps_to_distance(ps_seconds, vp, vs):
-    return (vp * vs / (vp - vs)) * ps_seconds
 
-def latlon_to_xy_km(lat, lon, lat0, lon0):
-    x = (lon - lon0) * 111.32 * math.cos(math.radians(lat0))
-    y = (lat - lat0) * 110.57
+# -----------------------------
+# 2. 세션 상태
+# -----------------------------
+if "student_points" not in st.session_state:
+    st.session_state.student_points = {}
+
+if "circles" not in st.session_state:
+    st.session_state.circles = {}
+
+if "show_answer" not in st.session_state:
+    st.session_state.show_answer = False
+
+
+# -----------------------------
+# 3. 수학 함수
+# -----------------------------
+def parse_circle_equation(eq):
+    """
+    입력 예:
+    (x-37.57)^2 + (y-126.98)^2 = 1.32^2
+    (x-37.57)^2+(y-126.98)^2=1.74
+    """
+    eq = eq.replace(" ", "")
+
+    pattern = r"\(x([+-]\d+\.?\d*)\)\^2\+\(y([+-]\d+\.?\d*)\)\^2=(\d+\.?\d*)(\^2)?"
+    match = re.match(pattern, eq)
+
+    if not match:
+        return None
+
+    x_part = float(match.group(1))
+    y_part = float(match.group(2))
+    value = float(match.group(3))
+    squared = match.group(4)
+
+    h = -x_part
+    k = -y_part
+    r = value if squared else np.sqrt(value)
+
+    return h, k, r
+
+
+def circle_points(h, k, r, n=300):
+    t = np.linspace(0, 2 * np.pi, n)
+    x = h + r * np.cos(t)
+    y = k + r * np.sin(t)
     return x, y
 
-def xy_km_to_latlon(x, y, lat0, lon0):
-    lat = y / 110.57 + lat0
-    lon = x / (111.32 * math.cos(math.radians(lat0))) + lon0
-    return lat, lon
 
-def circle_intersections(c1, r1, c2, r2):
-    x0, y0 = c1
-    x1, y1 = c2
-    dx, dy = x1 - x0, y1 - y0
-    d = math.hypot(dx, dy)
+def circle_intersections(c1, c2):
+    x0, y0, r0 = c1
+    x1, y1, r1 = c2
 
-    if d == 0 or d > r1 + r2 or d < abs(r1 - r2):
+    dx = x1 - x0
+    dy = y1 - y0
+    d = np.sqrt(dx**2 + dy**2)
+
+    if d == 0 or d > r0 + r1 or d < abs(r0 - r1):
         return []
 
-    a = (r1**2 - r2**2 + d**2) / (2 * d)
-    h2 = r1**2 - a**2
-    if h2 < 0:
-        h2 = 0
+    a = (r0**2 - r1**2 + d**2) / (2 * d)
+    h_sq = r0**2 - a**2
 
-    h = math.sqrt(h2)
+    if h_sq < 0:
+        return []
+
+    h = np.sqrt(h_sq)
     xm = x0 + a * dx / d
     ym = y0 + a * dy / d
 
-    rx = -dy * h / d
-    ry = dx * h / d
+    xs1 = xm + h * dy / d
+    ys1 = ym - h * dx / d
+    xs2 = xm - h * dy / d
+    ys2 = ym + h * dx / d
 
-    return [(xm + rx, ym + ry), (xm - rx, ym - ry)]
+    return [(xs1, ys1), (xs2, ys2)]
 
-def estimate_epicenter_least_squares(points, radii):
-    """
-    원 방정식:
-    (x-xi)^2 + (y-yi)^2 = ri^2
 
-    첫 번째 원을 기준으로 빼면 선형식이 됨.
-    Ax = b 형태로 최소제곱 추정.
-    """
-    x1, y1 = points[0]
-    r1 = radii[0]
+def radical_axis(c1, c2):
+    x1, y1, r1 = c1
+    x2, y2, r2 = c2
 
-    A = []
-    b = []
-    for i in range(1, len(points)):
-        xi, yi = points[i]
-        ri = radii[i]
+    # Ax + By + C = 0
+    A = 2 * (x2 - x1)
+    B = 2 * (y2 - y1)
+    C = x1**2 + y1**2 - r1**2 - x2**2 - y2**2 + r2**2
 
-        A.append([2 * (xi - x1), 2 * (yi - y1)])
-        b.append((x1**2 + y1**2 - r1**2) - (xi**2 + yi**2 - ri**2))
+    return A, B, C
 
-    A = np.array(A)
-    b = np.array(b)
 
-    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
-    return sol[0], sol[1]
+def line_intersection(l1, l2):
+    A1, B1, C1 = l1
+    A2, B2, C2 = l2
 
-st.subheader("1️⃣ 실제 지진 데이터")
+    det = A1 * B2 - A2 * B1
 
-sample_quakes = pd.DataFrame({
-    "발생시각": [
-        "2026/06/10 03:16:57",
-        "2026/06/08 09:07:14",
-        "2026/04/05 22:10:26",
-        "2026/03/14 09:00:20",
-    ],
-    "규모": [2.9, 2.9, 2.4, 2.6],
-    "깊이(km)": [20, 5, 11, 11],
-    "위도": [35.67, 34.57, 35.08, 35.82],
-    "경도": [129.60, 128.28, 127.07, 128.35],
-    "위치": [
-        "울산 북구 동북동쪽 24km 해역",
-        "경남 통영시 남남서쪽 35km 해역",
-        "전남 화순군 동북동쪽 8km 지역",
-        "경북 성주군 남남동쪽 13km 지역",
-    ]
-})
+    if abs(det) < 1e-9:
+        return None
 
-uploaded = st.file_uploader(
-    "기상청 자료를 CSV로 내려받아 업로드할 수 있습니다. 없으면 예시 데이터를 사용합니다.",
-    type=["csv"]
-)
+    x = (B1 * C2 - B2 * C1) / det
+    y = (C1 * A2 - C2 * A1) / det
 
-if uploaded:
-    quake_df = pd.read_csv(uploaded)
-else:
-    quake_df = sample_quakes
+    return x, y
 
-st.dataframe(quake_df, use_container_width=True)
 
-selected_idx = st.selectbox(
-    "탐구할 지진 선택",
-    quake_df.index,
-    format_func=lambda i: f"{quake_df.loc[i, '발생시각']} | M{quake_df.loc[i, '규모']} | {quake_df.loc[i, '위치']}"
-)
+def add_base_layout(fig):
+    fig.update_layout(
+        height=650,
+        xaxis_title="위도 x",
+        yaxis_title="경도 y",
+        xaxis=dict(range=[34.5, 38.2], dtick=0.5),
+        yaxis=dict(range=[126.3, 129.6], dtick=0.5),
+        dragmode="pan",
+        hovermode="closest",
+    )
+    fig.update_yaxes(scaleanchor="x", scaleratio=1)
+    return fig
 
-quake = quake_df.loc[selected_idx]
-true_lat = float(quake["위도"])
-true_lon = float(quake["경도"])
 
-st.info(f"선택한 실제 진앙: 위도 {true_lat}, 경도 {true_lon} / {quake['위치']}")
+# -----------------------------
+# 4. 활동 안내
+# -----------------------------
+with st.expander("📌 관측소 정보 보기", expanded=True):
+    info_df = pd.DataFrame([
+        {
+            "관측소": name,
+            "위도 x": s["lat"],
+            "경도 y": s["lon"],
+        }
+        for name, s in stations.items()
+    ])
+    st.dataframe(info_df, use_container_width=True)
 
-st.subheader("2️⃣ 세 관측소 입력")
+st.divider()
 
-default_stations = pd.DataFrame({
-    "관측소": ["서울", "대전", "부산"],
-    "위도": [37.5665, 36.3504, 35.1796],
-    "경도": [126.9780, 127.3845, 129.0756],
-    "PS시_초": [42.0, 30.0, 18.0],
-})
+# -----------------------------
+# 5. 좌표평면에 관측소 위치 찍기
+# -----------------------------
+st.subheader("1단계. 관측소 위치를 좌표평면에 찍기")
 
-stations = st.data_editor(
-    default_stations,
-    num_rows="fixed",
-    use_container_width=True,
-    column_config={
-        "관측소": st.column_config.TextColumn("관측소"),
-        "위도": st.column_config.NumberColumn("위도", format="%.5f"),
-        "경도": st.column_config.NumberColumn("경도", format="%.5f"),
-        "PS시_초": st.column_config.NumberColumn("PS시(초)", min_value=0.0, step=0.1),
-    }
-)
+st.caption("아래 좌표 입력칸에 관측소의 위도와 경도를 넣고 [점 찍기]를 누르세요. 클릭으로만 모든 걸 해결하려는 욕망은 아름답지만, 수업 현장에서는 입력칸이 덜 배신합니다.")
 
-stations["진원거리_km"] = stations["PS시_초"].apply(lambda t: ps_to_distance(t, p_speed, s_speed))
+cols = st.columns(3)
 
-st.subheader("3️⃣ PS시로 진원거리 계산")
-st.dataframe(stations, use_container_width=True)
+for i, name in enumerate(stations.keys()):
+    with cols[i]:
+        st.markdown(f"### {name}")
+        x = st.number_input(f"{name} 위도 x", value=stations[name]["lat"], step=0.01, key=f"x_{name}")
+        y = st.number_input(f"{name} 경도 y", value=stations[name]["lon"], step=0.01, key=f"y_{name}")
 
-lat0 = stations["위도"].mean()
-lon0 = stations["경도"].mean()
+        if st.button(f"{name} 점 찍기", key=f"plot_{name}"):
+            st.session_state.student_points[name] = {"lat": x, "lon": y}
 
-xy_points = []
-for _, row in stations.iterrows():
-    x, y = latlon_to_xy_km(row["위도"], row["경도"], lat0, lon0)
-    xy_points.append((x, y))
-
-radii = stations["진원거리_km"].to_numpy()
-
-try:
-    est_x, est_y = estimate_epicenter_least_squares(xy_points, radii)
-    est_lat, est_lon = xy_km_to_latlon(est_x, est_y, lat0, lon0)
-except Exception:
-    est_x, est_y, est_lat, est_lon = None, None, None, None
-
-true_x, true_y = latlon_to_xy_km(true_lat, true_lon, lat0, lon0)
-
-st.subheader("4️⃣ 좌표평면에 세 원 그리기")
+# -----------------------------
+# 6. 진원거리 입력
+# -----------------------------
+st.subheader("2단계. 관측소 점에 마우스를 올려 PS시와 진원거리 확인하기")
 
 fig = go.Figure()
 
-theta = np.linspace(0, 2 * np.pi, 400)
-
-for i, row in stations.iterrows():
-    cx, cy = xy_points[i]
-    r = radii[i]
+for name, s in st.session_state.student_points.items():
+    real = stations[name]
 
     fig.add_trace(go.Scatter(
-        x=cx + r * np.cos(theta),
-        y=cy + r * np.sin(theta),
-        mode="lines",
-        name=f"{row['관측소']} 원"
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=[cx],
-        y=[cy],
+        x=[s["lat"]],
+        y=[s["lon"]],
         mode="markers+text",
-        text=[row["관측소"]],
+        text=[name],
         textposition="top center",
-        marker=dict(size=10),
-        name=f"{row['관측소']} 관측소"
+        marker=dict(size=14),
+        name=name,
+        hovertemplate=(
+            f"<b>{name}</b><br>"
+            f"PS시: {real['ps_time']}초<br>"
+            f"진원거리: {real['distance_km']} km<br>"
+            f"반지름 환산: {real['radius_degree']:.3f} 도"
+            "<extra></extra>"
+        )
     ))
 
-all_intersections = []
-pairs = [(0, 1), (1, 2), (0, 2)]
-
-for a, b in pairs:
-    inters = circle_intersections(xy_points[a], radii[a], xy_points[b], radii[b])
-    for p in inters:
-        all_intersections.append(p)
-    if len(inters) == 2:
-        fig.add_trace(go.Scatter(
-            x=[inters[0][0], inters[1][0]],
-            y=[inters[0][1], inters[1][1]],
-            mode="lines",
-            line=dict(dash="dash"),
-            name=f"{stations.loc[a, '관측소']}-{stations.loc[b, '관측소']} 공통현"
-        ))
-
-if all_intersections:
-    ix = [p[0] for p in all_intersections]
-    iy = [p[1] for p in all_intersections]
-    fig.add_trace(go.Scatter(
-        x=ix,
-        y=iy,
-        mode="markers",
-        marker=dict(size=8, symbol="x"),
-        name="원들의 교점"
-    ))
-
-if est_x is not None:
-    fig.add_trace(go.Scatter(
-        x=[est_x],
-        y=[est_y],
-        mode="markers+text",
-        text=["추정 진원"],
-        textposition="bottom center",
-        marker=dict(size=14, symbol="star"),
-        name="추정 진원"
-    ))
-
-fig.add_trace(go.Scatter(
-    x=[true_x],
-    y=[true_y],
-    mode="markers+text",
-    text=["실제 진앙"],
-    textposition="top center",
-    marker=dict(size=14, symbol="diamond"),
-    name="실제 진앙"
-))
-
-fig.update_layout(
-    width=900,
-    height=700,
-    xaxis_title="동서 방향 거리 x(km)",
-    yaxis_title="남북 방향 거리 y(km)",
-    yaxis_scaleanchor="x",
-    template="plotly_white",
-    legend=dict(orientation="h")
-)
-
+add_base_layout(fig)
 st.plotly_chart(fig, use_container_width=True)
 
-st.subheader("5️⃣ 결과 해석")
+distance_inputs = {}
 
-if est_x is not None:
-    error = math.hypot(est_x - true_x, est_y - true_y)
+if len(st.session_state.student_points) == 3:
+    st.markdown("### 관측소별 진원거리 입력")
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("추정 진원 위도", f"{est_lat:.5f}")
-    col2.metric("추정 진원 경도", f"{est_lon:.5f}")
-    col3.metric("실제 진앙과 오차", f"{error:.2f} km")
+    dcols = st.columns(3)
+    for i, name in enumerate(stations.keys()):
+        with dcols[i]:
+            distance_inputs[name] = st.number_input(
+                f"{name} 진원거리 km",
+                min_value=0.0,
+                step=1.0,
+                key=f"dist_{name}"
+            )
 
-    st.markdown(f"""
-### AI 탐구 질문 예시
-- PS시가 1초만 달라져도 진원 위치는 얼마나 변할까?
-- P파와 S파 속도 값을 다르게 설정하면 결과가 어떻게 달라질까?
-- 세 원이 한 점에서 만나지 않는 이유는 무엇일까?
-- 관측소를 바꾸면 오차가 줄어들까?
-- AI에게 오차 원인을 설명하게 한 뒤, 학생 설명과 비교해 보자.
+    st.divider()
+
+    # -----------------------------
+    # 7. 원의 방정식 입력
+    # -----------------------------
+    st.subheader("3단계. 원의 방정식 입력하기")
+
+    st.markdown("""
+입력 형식 예시:
+
+`(x-37.57)^2 + (y-126.98)^2 = 1.23^2`
+
+주의: 여기서 반지름은 km가 아니라 좌표평면용 도 단위입니다.  
+대략 `진원거리 km ÷ 111`로 바꾸면 됩니다. 인간이 지구를 평면으로 펴는 순간 생기는 대가죠 🧭
 """)
-else:
-    st.warning("진원을 계산할 수 없습니다. 관측소 좌표나 PS시 값을 확인하세요.")
 
-st.subheader("6️⃣ 학생용 보고서 문장 자동 생성")
+    for name in stations.keys():
+        s = stations[name]
+        default_r = s["distance_km"] / KM_PER_DEGREE
+        default_eq = f"(x-{s['lat']})^2 + (y-{s['lon']})^2 = {default_r:.3f}^2"
 
-if est_x is not None:
-    report = f"""
-우리는 선택한 지진 자료를 바탕으로 세 관측소의 위도와 경도를 좌표평면의 좌표로 변환하였다.
-각 관측소에서 구한 PS시를 이용하여 진원거리를 계산하였고,
-이를 반지름으로 하는 세 원을 그렸다.
+        eq = st.text_input(
+            f"{name} 원의 방정식",
+            value=default_eq,
+            key=f"eq_{name}"
+        )
 
-세 원은 측정 오차와 단순화된 파동 속도 때문에 정확히 한 점에서 만나지 않을 수 있었다.
-따라서 원들의 교점과 공통현을 이용하여 진원의 위치를 추정하였다.
+        parsed = parse_circle_equation(eq)
 
-이번 탐구에서 추정한 진원은 위도 {est_lat:.5f}, 경도 {est_lon:.5f}이고,
-기상청 자료의 실제 진앙과의 오차는 약 {error:.2f} km였다.
-"""
-    st.text_area("보고서 초안", report, height=220)
+        if parsed:
+            st.session_state.circles[name] = parsed
+        else:
+            st.warning(f"{name}의 원의 방정식 형식이 맞지 않습니다.")
+
+# -----------------------------
+# 8. 원, 교점, 현, 진원 표시
+# -----------------------------
+if len(st.session_state.circles) == 3:
+    st.subheader("4단계. 세 원의 교점과 현 확인하기")
+
+    fig2 = go.Figure()
+
+    # 관측소 점
+    for name, s in stations.items():
+        fig2.add_trace(go.Scatter(
+            x=[s["lat"]],
+            y=[s["lon"]],
+            mode="markers+text",
+            text=[name],
+            textposition="top center",
+            marker=dict(size=12),
+            name=name
+        ))
+
+    # 원
+    circle_list = []
+    names = list(st.session_state.circles.keys())
+
+    for name in names:
+        h, k, r = st.session_state.circles[name]
+        circle_list.append((h, k, r))
+        cx, cy = circle_points(h, k, r)
+
+        fig2.add_trace(go.Scatter(
+            x=cx,
+            y=cy,
+            mode="lines",
+            name=f"{name} 원"
+        ))
+
+    # 원끼리의 교점
+    pair_intersections = []
+    radical_lines = []
+
+    for i in range(3):
+        for j in range(i + 1, 3):
+            c1 = circle_list[i]
+            c2 = circle_list[j]
+
+            pts = circle_intersections(c1, c2)
+            pair_intersections.extend(pts)
+
+            line = radical_axis(c1, c2)
+            radical_lines.append(line)
+
+            if len(pts) == 2:
+                x_vals = [pts[0][0], pts[1][0]]
+                y_vals = [pts[0][1], pts[1][1]]
+
+                fig2.add_trace(go.Scatter(
+                    x=x_vals,
+                    y=y_vals,
+                    mode="lines+markers",
+                    name=f"{names[i]}-{names[j]} 현"
+                ))
+
+    if pair_intersections:
+        fig2.add_trace(go.Scatter(
+            x=[p[0] for p in pair_intersections],
+            y=[p[1] for p in pair_intersections],
+            mode="markers",
+            marker=dict(size=10, symbol="x"),
+            name="원들의 교점"
+        ))
+
+    # 세 현의 교점, 즉 근축의 교점
+    estimated = None
+    if len(radical_lines) >= 2:
+        estimated = line_intersection(radical_lines[0], radical_lines[1])
+
+    if estimated:
+        ex, ey = estimated
+        fig2.add_trace(go.Scatter(
+            x=[ex],
+            y=[ey],
+            mode="markers+text",
+            text=["추정 진원"],
+            textposition="bottom center",
+            marker=dict(size=16, symbol="star"),
+            name="추정 진원"
+        ))
+
+    if st.session_state.show_answer:
+        fig2.add_trace(go.Scatter(
+            x=[actual_epicenter["lat"]],
+            y=[actual_epicenter["lon"]],
+            mode="markers+text",
+            text=["실제 진원"],
+            textposition="top center",
+            marker=dict(size=18, symbol="diamond"),
+            name="실제 진원"
+        ))
+
+    add_base_layout(fig2)
+    st.plotly_chart(fig2, use_container_width=True)
+
+    if estimated:
+        st.success(f"추정 진원 위치: 위도 {estimated[0]:.3f}, 경도 {estimated[1]:.3f}")
+
+    st.divider()
+
+    # -----------------------------
+    # 9. 학생 진원 입력 후 실제 결과 확인
+    # -----------------------------
+    st.subheader("5단계. 진원 위치 추측하기")
+
+    guess_lat = st.number_input("추측한 진원 위도 x", step=0.001, format="%.3f")
+    guess_lon = st.number_input("추측한 진원 경도 y", step=0.001, format="%.3f")
+
+    if guess_lat != 0.0 and guess_lon != 0.0:
+        if st.button("실제결과 확인"):
+            st.session_state.show_answer = True
+
+            error = np.sqrt(
+                (guess_lat - actual_epicenter["lat"]) ** 2
+                + (guess_lon - actual_epicenter["lon"]) ** 2
+            ) * KM_PER_DEGREE
+
+            if error <= 20:
+                st.success(f"정확합니다! 실제 진원과의 오차는 약 {error:.1f} km입니다.")
+            else:
+                st.error(f"조금 차이가 있습니다. 실제 진원과의 오차는 약 {error:.1f} km입니다.")
+
+            st.info(
+                f"실제 진원: 위도 {actual_epicenter['lat']}, "
+                f"경도 {actual_epicenter['lon']}"
+            )
