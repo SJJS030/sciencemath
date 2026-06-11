@@ -6,7 +6,7 @@
 import math
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
+import matplotlib.pyplot as plt
 import streamlit as st
 
 st.set_page_config(page_title="AI 융합 지진 진원 찾기", layout="wide")
